@@ -16,6 +16,11 @@
                environment variable named in ai-apps.json, you get a real answer.
       Browser  Opens the app (with the prompt where supported) in the default browser,
                for real browser traffic.
+      Ask      Checks that the app is reachable (GET its page). If it is, asks a random
+               question from ai-apps.json and waits for the answer: through the API when
+               a key is set (environment variable or the API keys dialog), otherwise in
+               the browser with -AskInBrowser, otherwise through the API without a key
+               (shows 'No API key').
 
     Apps, URLs, API formats, prompts and block-page markers live in ai-apps.json.
 
@@ -28,6 +33,10 @@
 
 .EXAMPLE
     .\AiTrafficGenerator.ps1 -NoGui -Category Chatbot -RandomPrompt -DurationMinutes 30 -DelayMs 2000
+
+.EXAMPLE
+    .\AiTrafficGenerator.ps1 -NoGui -Mode Ask -Apps chatgpt,claude,gemini
+    Asks each reachable app a random question and prints the answers.
 
 .EXAMPLE
     .\AiTrafficGenerator.ps1 -List
@@ -46,6 +55,8 @@ param(
     [int]$DelayMs = 500,
     [int]$Concurrency = 4,
     [int]$TimeoutSec = 20,
+    [int]$AnswerTimeoutSec = 120,
+    [switch]$AskInBrowser,
     [string]$Prompt,
     [switch]$RandomPrompt,
     [switch]$Shuffle,
@@ -63,7 +74,8 @@ if ($protocols -ne [Net.SecurityProtocolType]::SystemDefault -and -not ($protoco
     [Net.ServicePointManager]::SecurityProtocol = $protocols -bor [Net.SecurityProtocolType]::Tls12
 }
 
-$AllModes = @('Web', 'Api', 'Browser')
+$AllModes = @('Web', 'Api', 'Ask', 'Browser')
+$KeysFile = Join-Path $PSScriptRoot 'api-keys.json'
 
 # ---------------------------------------------------------------------------
 # Catalogue
@@ -89,6 +101,7 @@ function Get-AppModes($App) {
     $modes = @()
     if (@(Get-Prop $App 'web' @()).Count -gt 0 -or (Get-Prop $App 'promptUrl')) { $modes += 'Web'; $modes += 'Browser' }
     if (Get-Prop $App 'api') { $modes += 'Api' }
+    if ($modes.Count) { $modes += 'Ask' }
     return $modes
 }
 
@@ -108,46 +121,100 @@ function ConvertTo-JsonText([string]$Text) {
 
 function New-Job($App, [string]$Mode, [string]$Method, [string]$Url, [string]$PromptText, [string]$Body = $null, [hashtable]$Headers = @{}, [string]$Note = '') {
     return [pscustomobject]@{
-        AppId = $App.id; App = $App.name; Mode = $Mode; Method = $Method; Url = $Url
+        AppRef = $App; AppId = $App.id; App = $App.name; Mode = $Mode; Method = $Method; Url = $Url
         Body = $Body; Headers = $Headers; Prompt = $PromptText; Note = $Note
+        FollowUp = ''; TimeoutSec = 0
     }
+}
+
+# The API key for an app's API: environment variable, or saved with the API keys dialog.
+function Get-ApiKey($Api) {
+    $auth = Get-Prop $Api 'auth'
+    if (-not $auth) { return $null }
+    $name = [string](Get-Prop $auth 'env' '')
+    if (-not $name) { return $null }
+    return [Environment]::GetEnvironmentVariable($name)
+}
+
+function New-ApiJob($App, [string]$Mode, [string]$PromptText) {
+    $api = Get-Prop $App 'api'
+    $model = Get-Prop $api 'model' ''
+    $body = (ConvertTo-Json -InputObject $api.body -Depth 20 -Compress).Replace('{{model}}', (ConvertTo-JsonText $model)).Replace('{{prompt}}', (ConvertTo-JsonText $PromptText))
+    $headers = @{}
+    $extra = Get-Prop $api 'headers'
+    if ($extra) { foreach ($p in $extra.PSObject.Properties) { $headers[$p.Name] = [string]$p.Value } }
+    $note = 'no API key'
+    $key = Get-ApiKey $api
+    if ($key) {
+        $auth = $api.auth
+        $headers[(Get-Prop $auth 'header' 'Authorization')] = (Get-Prop $auth 'prefix' '') + $key
+        $note = 'API key ' + $auth.env
+    }
+    return New-Job $App $Mode 'POST' ($api.url.Replace('{{model}}', $model)) $PromptText $body $headers $note
+}
+
+function Get-PromptUrl($App, [string]$PromptText) {
+    $promptUrl = Get-Prop $App 'promptUrl'
+    if ($promptUrl -and $PromptText) { return $promptUrl.Replace('{{prompt}}', [Uri]::EscapeDataString($PromptText)) }
+    return $null
 }
 
 function New-AppJobs($App, [string[]]$Modes, [string]$PromptText) {
     $jobs = @()
-    $encoded = [Uri]::EscapeDataString($PromptText)
-    $promptUrl = Get-Prop $App 'promptUrl'
     $web = @(Get-Prop $App 'web' @())
+    $api = Get-Prop $App 'api'
 
     if ($Modes -contains 'Web') {
         foreach ($url in $web) { $jobs += New-Job $App 'Web' 'GET' $url '' }
-        if ($promptUrl -and $PromptText) { $jobs += New-Job $App 'Web' 'GET' ($promptUrl.Replace('{{prompt}}', $encoded)) $PromptText }
+        $url = Get-PromptUrl $App $PromptText
+        if ($url) { $jobs += New-Job $App 'Web' 'GET' $url $PromptText }
     }
 
-    $api = Get-Prop $App 'api'
-    if ($Modes -contains 'Api' -and $api) {
-        $model = Get-Prop $api 'model' ''
-        $body = (ConvertTo-Json -InputObject $api.body -Depth 20 -Compress).Replace('{{model}}', (ConvertTo-JsonText $model)).Replace('{{prompt}}', (ConvertTo-JsonText $PromptText))
-        $headers = @{}
-        $extra = Get-Prop $api 'headers'
-        if ($extra) { foreach ($p in $extra.PSObject.Properties) { $headers[$p.Name] = [string]$p.Value } }
-        $note = 'no API key'
-        $auth = Get-Prop $api 'auth'
-        if ($auth) {
-            $key = [Environment]::GetEnvironmentVariable([string](Get-Prop $auth 'env' ''))
-            if ($key) {
-                $headers[(Get-Prop $auth 'header' 'Authorization')] = (Get-Prop $auth 'prefix' '') + $key
-                $note = 'API key from ' + $auth.env
-            }
-        }
-        $jobs += New-Job $App 'Api' 'POST' ($api.url.Replace('{{model}}', $model)) $PromptText $body $headers $note
-    }
+    if ($Modes -contains 'Api' -and $api) { $jobs += New-ApiJob $App 'Api' $PromptText }
 
     if ($Modes -contains 'Browser') {
-        $url = if ($promptUrl -and $PromptText) { $promptUrl.Replace('{{prompt}}', $encoded) } elseif ($web.Count) { $web[0] } else { $null }
+        $url = Get-PromptUrl $App $PromptText
+        if (-not $url -and $web.Count) { $url = $web[0] }
         if ($url) { $jobs += New-Job $App 'Browser' 'OPEN' $url $PromptText }
     }
+
+    # Ask: first check that the app is reachable, then (in Invoke-EngineStep) ask a question.
+    if ($Modes -contains 'Ask') {
+        $url = if ($web.Count) { $web[0] } elseif ($api) { $api.url.Replace('{{model}}', [string](Get-Prop $api 'model' '')) } else { $null }
+        if ($url) {
+            $check = New-Job $App 'Check' 'GET' $url ''
+            $check.FollowUp = 'Ask'
+            $jobs += $check
+        }
+    }
     return $jobs
+}
+
+# The question sent after a successful check: through the API when there is a key,
+# otherwise in the browser (if allowed), otherwise through the API anyway (answers 401).
+function New-AskJob($Settings, $App) {
+    $questions = @($Settings.Questions)
+    if ($questions.Count -eq 0) { $questions = @($Settings.Prompts) }
+    $question = if ($questions.Count) { [string]($questions | Get-Random) } else { 'Hello! Who are you?' }
+    $api = Get-Prop $App 'api'
+    $browserUrl = Get-PromptUrl $App $question
+    if ($api -and (Get-ApiKey $api)) {
+        $job = New-ApiJob $App 'Ask' $question
+        $job.TimeoutSec = $Settings.AnswerTimeoutSec
+        return $job
+    }
+    if ($Settings.AskInBrowser -and $browserUrl) { return New-Job $App 'Ask' 'OPEN' $browserUrl $question }
+    if ($api) {
+        $job = New-ApiJob $App 'Ask' $question
+        $job.TimeoutSec = $Settings.AnswerTimeoutSec
+        return $job
+    }
+    $why = if ($Settings.AskInBrowser) { 'This app has no API and no prompt URL, so the question cannot be sent automatically' }
+           else { "This app has no API. Use 'No API key: ask in the browser' (-AskInBrowser) to ask it there" }
+    $web = @(Get-Prop $App 'web' @())
+    $skip = New-Job $App 'Ask' 'SKIP' $(if ($web.Count) { $web[0] } else { '' }) $question
+    $skip.Note = $why
+    return $skip
 }
 
 function Get-RoundPrompt($Settings) {
@@ -166,7 +233,7 @@ function New-RoundJobs($Settings) {
 # Sending and classifying
 # ---------------------------------------------------------------------------
 
-function New-HttpClient([int]$TimeoutSec, [string]$Proxy) {
+function New-HttpClient([string]$Proxy) {
     $handler = New-Object System.Net.Http.HttpClientHandler
     $handler.AllowAutoRedirect = $true
     $handler.AutomaticDecompression = [Net.DecompressionMethods]::GZip -bor [Net.DecompressionMethods]::Deflate
@@ -177,7 +244,8 @@ function New-HttpClient([int]$TimeoutSec, [string]$Proxy) {
     # Corporate proxies that require Windows sign-in (.NET Framework 4.7.1+ / PowerShell 7).
     if ($handler.PSObject.Properties['DefaultProxyCredentials']) { $handler.DefaultProxyCredentials = [Net.CredentialCache]::DefaultCredentials }
     $client = New-Object System.Net.Http.HttpClient($handler)
-    $client.Timeout = [TimeSpan]::FromSeconds([Math]::Max(1, $TimeoutSec))
+    # Timeouts are per request (see Start-AiRequest): questions may take longer than page loads.
+    $client.Timeout = [Threading.Timeout]::InfiniteTimeSpan
     $client.MaxResponseContentBufferSize = 50MB
     return $client
 }
@@ -185,7 +253,7 @@ function New-HttpClient([int]$TimeoutSec, [string]$Proxy) {
 function Start-AiRequest($State, $Job) {
     $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::new($Job.Method), $Job.Url)
     [void]$request.Headers.TryAddWithoutValidation('User-Agent', $State.Settings.UserAgent)
-    if ($Job.Mode -eq 'Web') {
+    if ($Job.Method -eq 'GET') {
         [void]$request.Headers.TryAddWithoutValidation('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8')
         [void]$request.Headers.TryAddWithoutValidation('Accept-Language', 'en-US,en;q=0.9')
     } else {
@@ -195,18 +263,21 @@ function Start-AiRequest($State, $Job) {
     if ($null -ne $Job.Body) {
         $request.Content = New-Object System.Net.Http.StringContent($Job.Body, [Text.Encoding]::UTF8, 'application/json')
     }
+    $timeout = if ($Job.TimeoutSec -gt 0) { $Job.TimeoutSec } else { $State.Settings.TimeoutSec }
+    $cancel = [Threading.CancellationTokenSource]::CreateLinkedTokenSource($State.Cancel.Token)
+    $cancel.CancelAfter([TimeSpan]::FromSeconds([Math]::Max(1, $timeout)))
     return [pscustomobject]@{
-        Job = $Job; Request = $request; Watch = [Diagnostics.Stopwatch]::StartNew()
-        Task = $State.Client.SendAsync($request, $State.Cancel.Token)
+        Job = $Job; Request = $request; Watch = [Diagnostics.Stopwatch]::StartNew(); Cancel = $cancel; TimeoutSec = $timeout
+        Task = $State.Client.SendAsync($request, $cancel.Token)
     }
 }
 
-function New-Result($Job, $Status, [string]$Result, [string]$Detail, $Ms, [string]$FinalUrl = '') {
+function New-Result($Job, $Status, [string]$Result, [string]$Detail, $Ms, [string]$FinalUrl = '', [string]$Answer = '') {
     if ($Job.Note) { $Detail = if ($Detail) { "$Detail ($($Job.Note))" } else { $Job.Note } }
     return [pscustomobject][ordered]@{
         Time = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'); App = $Job.App; Mode = $Job.Mode
         Method = $Job.Method; Url = $Job.Url; Status = $Status; Result = $Result; Ms = $Ms
-        Detail = $Detail; FinalUrl = $FinalUrl; Prompt = $Job.Prompt
+        Detail = $Detail; FinalUrl = $FinalUrl; Prompt = $Job.Prompt; Answer = $Answer
     }
 }
 
@@ -222,17 +293,17 @@ function Get-ErrorText($Exception) {
 function Get-AnswerText([string]$Body) {
     try { $o = $Body | ConvertFrom-Json } catch { return $null }
     $readers = @(
-        { $o.choices[0].message.content },          # OpenAI-compatible APIs
-        { $o.content[0].text },                     # Anthropic
-        { $o.candidates[0].content.parts[0].text }, # Gemini
-        { $o.message.content[0].text },             # Cohere
+        { $o.choices[0].message.content },                            # OpenAI-compatible APIs
+        { ($o.content | Where-Object { $_.type -eq 'text' } | ForEach-Object { $_.text }) -join "`n" }, # Anthropic
+        { ($o.candidates[0].content.parts | ForEach-Object { $_.text }) -join '' },                     # Gemini
+        { $o.message.content[0].text },                               # Cohere
         { $o.error.message },
         { if ($o.error -is [string]) { $o.error } },
         { $o.detail },
         { $o.message }
     )
     foreach ($read in $readers) {
-        try { $text = & $read; if ($text -is [string] -and $text) { return $text } } catch { }
+        try { $text = & $read; if ($text -is [string] -and $text.Trim()) { return $text.Trim() } } catch { }
     }
     return $null
 }
@@ -250,7 +321,7 @@ function Complete-AiRequest($State, $InFlight) {
     try {
         if ($task.IsCanceled) {
             if ($State.Stopping) { return New-Result $job '' 'Canceled' 'Stopped by user' $ms }
-            return New-Result $job '' 'Timeout' "No answer within $($State.Settings.TimeoutSec) s" $ms
+            return New-Result $job '' 'Timeout' "No answer within $($InFlight.TimeoutSec) s" $ms
         }
         if ($task.IsFaulted) {
             $err = Get-ErrorText $task.Exception
@@ -286,11 +357,26 @@ function Complete-AiRequest($State, $InFlight) {
                 }
             }
 
+            if ($job.Mode -eq 'Ask') {
+                $answer = Get-AnswerText $body
+                if ($status -lt 400 -and $answer) {
+                    return New-Result $job $status 'Answered' ('Q: ' + $job.Prompt + ' | A: ' + (Limit-Text $answer 400)) $ms $finalUrl $answer
+                }
+                if (($status -eq 401 -or $status -eq 403) -and $job.Note -eq 'no API key') {
+                    $keyName = Get-Prop (Get-Prop (Get-Prop $job.AppRef 'api') 'auth') 'env' 'the API key'
+                    $job.Note = ''
+                    return New-Result $job $status 'No API key' "The app is reachable, but its API needs a key for an answer: add $keyName with 'API keys...' (or the environment variable)" $ms $finalUrl
+                }
+                $detail = "HTTP $status from the API" + $(if ($answer) { ': ' + (Limit-Text $answer) } else { '' })
+                if ($status -lt 400) { $detail = "HTTP $status but no answer text found in the response" }
+                return New-Result $job $status 'Error' $detail $ms $finalUrl
+            }
+
             $detail = ''
             $challenged = $response.Headers.Contains('cf-mitigated') -or ($status -eq 403 -and $sample -match 'Just a moment|challenge-platform|Attention Required')
             if ($challenged) {
                 $detail = "HTTP $status bot challenge from the app's own site protection - the request passed the gateway"
-            } elseif ($job.Mode -eq 'Api') {
+            } elseif ($job.Method -eq 'POST') {
                 $answer = Get-AnswerText $body
                 if ($status -eq 401 -or $status -eq 403) { $detail = "HTTP $status from the API (not authorized) - the request passed the gateway" }
                 elseif ($status -lt 400) { $detail = 'Answer' }
@@ -300,6 +386,7 @@ function Complete-AiRequest($State, $InFlight) {
                 $title = [regex]::Match($sample, '<title[^>]*>([^<]*)</title>', 'IgnoreCase').Groups[1].Value
                 $detail = "HTTP $status" + $(if ($title) { ' - ' + (Limit-Text ([Net.WebUtility]::HtmlDecode($title)) 120) } else { '' })
             }
+            if ($job.FollowUp -eq 'Ask') { $detail = 'Reachable, asking a question next | ' + $detail }
             $requestedHost = ([Uri]$job.Url).Host
             if ($finalUrl -and ([Uri]$finalUrl).Host -ne $requestedHost) { $detail += " | redirected to $finalUrl" }
             return New-Result $job $status 'Allowed' $detail $ms $finalUrl
@@ -308,13 +395,15 @@ function Complete-AiRequest($State, $InFlight) {
         }
     } finally {
         $InFlight.Request.Dispose()
+        $InFlight.Cancel.Dispose()
     }
 }
 
 function Open-InBrowser($Job) {
     try {
         Start-Process $Job.Url
-        return New-Result $Job '' 'Opened' 'Opened in the default browser' 0
+        $detail = if ($Job.Mode -eq 'Ask') { "Asked in the default browser: $($Job.Prompt) - the answer appears there" } else { 'Opened in the default browser' }
+        return New-Result $Job '' 'Opened' $detail 0
     } catch {
         return New-Result $Job '' 'Error' (Get-ErrorText $_.Exception) 0
     }
@@ -329,9 +418,10 @@ function New-RunState($Settings) {
     if ($Settings.DurationMinutes -gt 0) { $endTime = (Get-Date).AddMinutes($Settings.DurationMinutes) }
     $state = @{
         Settings = $Settings
-        Client = New-HttpClient $Settings.TimeoutSec $Settings.Proxy
+        Client = New-HttpClient $Settings.Proxy
         Cancel = New-Object System.Threading.CancellationTokenSource
         Queue = New-Object 'System.Collections.Generic.Queue[object]'
+        FollowUps = New-Object 'System.Collections.Generic.Queue[object]'
         InFlight = New-Object 'System.Collections.Generic.List[object]'
         Results = New-Object 'System.Collections.Generic.List[object]'
         Round = 0
@@ -365,21 +455,30 @@ function Invoke-EngineStep($State) {
         $inFlight = $State.InFlight[$i]
         if ($inFlight.Task.IsCompleted) {
             $State.InFlight.RemoveAt($i)
-            $new.Add((Complete-AiRequest $State $inFlight))
+            $result = Complete-AiRequest $State $inFlight
+            $new.Add($result)
+            if ($inFlight.Job.FollowUp -eq 'Ask' -and $result.Result -eq 'Allowed' -and -not $State.Stopping) {
+                $State.FollowUps.Enqueue((New-AskJob $State.Settings $inFlight.Job.AppRef))
+            }
         }
     }
     while (-not $State.Stopping -and $State.InFlight.Count -lt $State.Settings.Concurrency -and (Get-Date) -ge $State.NextStart) {
-        if ($State.Queue.Count -eq 0 -and -not (Add-NextRound $State)) { break }
-        $job = $State.Queue.Dequeue()
+        # Questions for apps that just passed their check go first.
+        if ($State.FollowUps.Count) { $job = $State.FollowUps.Dequeue() }
+        elseif ($State.Queue.Count -or (Add-NextRound $State)) { $job = $State.Queue.Dequeue() }
+        else { break }
         $State.NextStart = (Get-Date).AddMilliseconds($State.Settings.DelayMs)
-        if ($job.Mode -eq 'Browser') {
+        if ($job.Method -eq 'OPEN') {
             $new.Add((Open-InBrowser $job))
+        } elseif ($job.Method -eq 'SKIP') {
+            $new.Add((New-Result $job '' 'Skipped' '' 0))
         } else {
             try { $State.InFlight.Add((Start-AiRequest $State $job)) }
             catch { $new.Add((New-Result $job '' 'Error' (Get-ErrorText $_.Exception) 0)) }
         }
     }
-    if ($State.InFlight.Count -eq 0 -and ($State.Stopping -or ($State.Queue.Count -eq 0 -and -not (Test-MoreRounds $State)))) {
+    $idle = $State.InFlight.Count -eq 0 -and $State.FollowUps.Count -eq 0
+    if ($idle -and ($State.Stopping -or ($State.Queue.Count -eq 0 -and -not (Test-MoreRounds $State)))) {
         $State.Done = $true
     }
     foreach ($result in $new) { $State.Results.Add($result) }
@@ -389,12 +488,53 @@ function Invoke-EngineStep($State) {
 function Stop-Run($State) {
     $State.Stopping = $true
     $State.Queue.Clear()
+    $State.FollowUps.Clear()
     $State.Cancel.Cancel()
 }
 
 function Close-Run($State) {
     $State.Client.Dispose()
     $State.Cancel.Dispose()
+}
+
+# ---------------------------------------------------------------------------
+# API keys saved by the window, encrypted for the current Windows user (DPAPI)
+# ---------------------------------------------------------------------------
+
+function Get-KeyNames($Cat) {
+    return @($Cat.apps | ForEach-Object { Get-Prop (Get-Prop (Get-Prop $_ 'api') 'auth') 'env' } | Where-Object { $_ } | Sort-Object -Unique)
+}
+
+function Read-SavedKeys {
+    $keys = @{}
+    if (-not (Test-Path -LiteralPath $KeysFile)) { return $keys }
+    $saved = Get-Content -LiteralPath $KeysFile -Raw | ConvertFrom-Json
+    foreach ($p in $saved.PSObject.Properties) {
+        try {
+            $secure = ConvertTo-SecureString $p.Value
+            $keys[$p.Name] = (New-Object System.Management.Automation.PSCredential('key', $secure)).GetNetworkCredential().Password
+        } catch {
+            Write-Warning "Cannot read the saved key $($p.Name) (saved by another Windows user or PC?)"
+        }
+    }
+    return $keys
+}
+
+function Save-Keys([hashtable]$Keys) {
+    $out = [ordered]@{}
+    foreach ($name in ($Keys.Keys | Sort-Object)) {
+        if ($Keys[$name]) { $out[$name] = ConvertTo-SecureString $Keys[$name] -AsPlainText -Force | ConvertFrom-SecureString }
+    }
+    if ($out.Count) { ConvertTo-Json -InputObject $out | Set-Content -LiteralPath $KeysFile -Encoding UTF8 }
+    elseif (Test-Path -LiteralPath $KeysFile) { Remove-Item -LiteralPath $KeysFile }
+}
+
+# Saved keys become process environment variables; variables set outside the tool win.
+function Import-SavedKeys {
+    try { $saved = Read-SavedKeys } catch { Write-Warning "Cannot read ${KeysFile}: $($_.Exception.Message)"; return }
+    foreach ($name in $saved.Keys) {
+        if (-not [Environment]::GetEnvironmentVariable($name)) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
+    }
 }
 
 function Get-Summary($Results) {
@@ -409,6 +549,21 @@ function Export-Results($Results, [string]$Path) {
 $ResultColors = @{
     'Allowed' = 'Green'; 'Blocked' = 'Red'; 'Blocked?' = 'Magenta'; 'TLS error' = 'Yellow'
     'Timeout' = 'Yellow'; 'Error' = 'Yellow'; 'Opened' = 'Cyan'; 'Canceled' = 'Gray'
+    'Answered' = 'Green'; 'No API key' = 'DarkCyan'; 'Skipped' = 'Gray'
+}
+
+# Settings shared by the console and the window; $Values holds the user's choices.
+function New-Settings($Cat, [hashtable]$Values) {
+    $settings = @{
+        Prompts = @($Cat.prompts | ForEach-Object { $_.text })
+        Questions = @(Get-Prop $Cat 'questions' @())
+        UserAgent = [string](Get-Prop $Cat 'userAgent' 'Mozilla/5.0')
+        Markers = @(Get-Prop $Cat 'blockMarkers' @())
+    }
+    foreach ($k in $Values.Keys) { $settings[$k] = $Values[$k] }
+    $settings.DelayMs = [Math]::Max(0, $settings.DelayMs)
+    $settings.Concurrency = [Math]::Max(1, $settings.Concurrency)
+    return $settings
 }
 
 # ---------------------------------------------------------------------------
@@ -429,14 +584,13 @@ function Invoke-Console($Cat) {
     if ($unknown.Count) { throw "Unknown app ID(s): $($unknown -join ', '). Run with -List to see them." }
     if ($selected.Count -eq 0) { throw 'No apps selected.' }
 
-    $prompts = @($Cat.prompts | ForEach-Object { $_.text })
-    $promptText = if ($Prompt) { $Prompt } elseif ($prompts.Count) { $prompts[0] } else { 'Hello' }
-    $settings = @{
-        Apps = $selected; Modes = $modes; Prompts = $prompts; PromptText = $promptText
+    $first = @($Cat.prompts | ForEach-Object { $_.text } | Select-Object -First 1)
+    $promptText = if ($Prompt) { $Prompt } elseif ($first.Count) { $first[0] } else { 'Hello' }
+    $settings = New-Settings $Cat @{
+        Apps = $selected; Modes = $modes; PromptText = $promptText
         RandomPrompt = [bool]$RandomPrompt; Shuffle = [bool]$Shuffle; Rounds = $Rounds
-        DurationMinutes = $DurationMinutes; DelayMs = [Math]::Max(0, $DelayMs)
-        Concurrency = [Math]::Max(1, $Concurrency); TimeoutSec = $TimeoutSec; Proxy = $Proxy
-        UserAgent = [string](Get-Prop $Cat 'userAgent' 'Mozilla/5.0'); Markers = @(Get-Prop $Cat 'blockMarkers' @())
+        DurationMinutes = $DurationMinutes; DelayMs = $DelayMs; Concurrency = $Concurrency
+        TimeoutSec = $TimeoutSec; AnswerTimeoutSec = $AnswerTimeoutSec; AskInBrowser = [bool]$AskInBrowser; Proxy = $Proxy
     }
 
     $until = if ($DurationMinutes -gt 0) { "for $DurationMinutes min" } elseif ($Rounds -le 0) { 'until Ctrl+C' } else { "$Rounds round(s)" }
@@ -447,8 +601,12 @@ function Invoke-Console($Cat) {
         while (-not $state.Done) {
             foreach ($r in (Invoke-EngineStep $state)) {
                 $color = $ResultColors[$r.Result]; if (-not $color) { $color = 'White' }
-                $line = '{0} {1,-9} {2,-22} {3,-7} {4,-4} {5} [{6} ms] {7}' -f $r.Time.Substring(11), $r.Result, (Limit-Text $r.App 22), $r.Mode, $r.Status, (Limit-Text $r.Url 70), $r.Ms, $r.Detail
+                $line = '{0} {1,-10} {2,-22} {3,-7} {4,-4} {5} [{6} ms] {7}' -f $r.Time.Substring(11), $r.Result, (Limit-Text $r.App 22), $r.Mode, $r.Status, (Limit-Text $r.Url 70), $r.Ms, $(if ($r.Answer) { '' } else { $r.Detail })
                 Write-Host $line -ForegroundColor $color
+                if ($r.Answer) {
+                    Write-Host "    Q: $($r.Prompt)" -ForegroundColor Cyan
+                    Write-Host (($r.Answer -split "`r?`n" | ForEach-Object { "    $_" }) -join [Environment]::NewLine)
+                }
             }
             if (-not $state.Done) { Start-Sleep -Milliseconds 50 }
         }
@@ -545,6 +703,13 @@ function Show-Window {
     $modeFlow.Controls.AddRange(@($chkWeb, $chkApi, $chkBrowser))
     Add-Row 'Send' $modeFlow
 
+    $askFlow = New-Flow
+    $chkAsk = New-Check 'Ask a random question when the app is reachable, and wait for the answer' $false
+    $chkAskBrowser = New-Check 'No API key: ask in the browser' $true
+    $numAnswerTimeout = New-Number 5 3600 120
+    $askFlow.Controls.AddRange(@($chkAsk, $chkAskBrowser, (New-Caption 'Answer timeout'), $numAnswerTimeout, (New-Caption 's')))
+    Add-Row 'Ask' $askFlow
+
     $promptFlow = New-Flow
     $cmbPrompt = New-Object System.Windows.Forms.ComboBox; $cmbPrompt.DropDownStyle = 'DropDownList'; $cmbPrompt.Width = 260
     $chkRandom = New-Check 'Random preset per app' $false
@@ -581,7 +746,8 @@ function Show-Window {
     $btnExport = New-Object System.Windows.Forms.Button; $btnExport.Text = 'Export CSV...'; $btnExport.AutoSize = $true
     $btnEdit = New-Object System.Windows.Forms.Button; $btnEdit.Text = 'Edit catalogue'; $btnEdit.AutoSize = $true
     $btnReload = New-Object System.Windows.Forms.Button; $btnReload.Text = 'Reload catalogue'; $btnReload.AutoSize = $true
-    $buttons.Controls.AddRange(@($btnStart, $btnStop, $btnClear, $btnExport, $btnEdit, $btnReload))
+    $btnKeys = New-Object System.Windows.Forms.Button; $btnKeys.Text = 'API keys...'; $btnKeys.AutoSize = $true
+    $buttons.Controls.AddRange(@($btnStart, $btnStop, $btnClear, $btnExport, $btnKeys, $btnEdit, $btnReload))
     Add-Row '' $buttons
 
     # --- Results --------------------------------------------------------------
@@ -590,7 +756,16 @@ function Show-Window {
     foreach ($col in @(@('Time', 130), @('Result', 75), @('App', 140), @('Mode', 60), @('Status', 55), @('ms', 55), @('URL', 330), @('Detail', 600))) {
         [void]$list.Columns.Add($col[0], $col[1])
     }
-    $split.Panel2.Controls.Add($list)
+    $resultSplit = New-Object System.Windows.Forms.SplitContainer
+    $resultSplit.Dock = 'Fill'; $resultSplit.Orientation = 'Horizontal'
+    $split.Panel2.Controls.Add($resultSplit)
+    $resultSplit.Panel1.Controls.Add($list)
+
+    $details = New-Object System.Windows.Forms.TextBox
+    $details.Dock = 'Fill'; $details.Multiline = $true; $details.ReadOnly = $true; $details.ScrollBars = 'Vertical'
+    $details.BackColor = [System.Drawing.SystemColors]::Window
+    $details.Text = 'Select a row to see the full request, question and answer.'
+    $resultSplit.Panel2.Controls.Add($details)
 
     $statusBar = New-Object System.Windows.Forms.StatusStrip
     $statusLabel = New-Object System.Windows.Forms.ToolStripStatusLabel
@@ -603,7 +778,8 @@ function Show-Window {
         'Allowed' = [System.Drawing.Color]::FromArgb(225, 245, 225); 'Blocked' = [System.Drawing.Color]::FromArgb(250, 215, 215)
         'Blocked?' = [System.Drawing.Color]::FromArgb(245, 225, 245); 'TLS error' = [System.Drawing.Color]::FromArgb(255, 243, 205)
         'Timeout' = [System.Drawing.Color]::FromArgb(255, 243, 205); 'Error' = [System.Drawing.Color]::FromArgb(255, 243, 205)
-        'Opened' = [System.Drawing.Color]::FromArgb(220, 238, 250)
+        'Opened' = [System.Drawing.Color]::FromArgb(220, 238, 250); 'Answered' = [System.Drawing.Color]::FromArgb(190, 235, 190)
+        'No API key' = [System.Drawing.Color]::FromArgb(225, 235, 245); 'Skipped' = [System.Drawing.Color]::FromArgb(235, 235, 235)
     }
 
     # --- Behaviour ------------------------------------------------------------
@@ -615,7 +791,7 @@ function Show-Window {
         $appList.Items.Clear()
         $ui.Apps = @()
         foreach ($app in @($ui.Catalog.apps)) {
-            $kinds = @(Get-AppModes $app | Where-Object { $_ -ne 'Browser' }) -join '+'
+            $kinds = @(Get-AppModes $app | Where-Object { $_ -in 'Web', 'Api' }) -join '+'
             $label = '{0}   [{1}, {2}]' -f $app.name, (Get-Prop $app 'category' 'Other'), $kinds
             $ui.Apps += [pscustomobject]@{ App = $app; Label = $label }
             [void]$appList.Items.Add($label, ($firstLoad -or $checkedIds -contains $app.id))
@@ -658,7 +834,7 @@ function Show-Window {
 
     $setRunning = {
         param([bool]$Running)
-        $btnStart.Enabled = -not $Running; $btnStop.Enabled = $Running; $btnReload.Enabled = -not $Running
+        $btnStart.Enabled = -not $Running; $btnStop.Enabled = $Running; $btnReload.Enabled = -not $Running; $btnKeys.Enabled = -not $Running
         $appList.Enabled = -not $Running
     }
 
@@ -667,21 +843,23 @@ function Show-Window {
         if ($chkWeb.Checked) { $modes += 'Web' }
         if ($chkApi.Checked) { $modes += 'Api' }
         if ($chkBrowser.Checked) { $modes += 'Browser' }
+        if ($chkAsk.Checked) { $modes += 'Ask' }
         $apps = @(for ($i = 0; $i -lt $ui.Apps.Count; $i++) { if ($appList.GetItemChecked($i)) { $ui.Apps[$i].App } })
         if ($modes.Count -eq 0) { [void][System.Windows.Forms.MessageBox]::Show('Choose at least one traffic type.', 'AI Traffic Generator'); return }
         if ($apps.Count -eq 0) { [void][System.Windows.Forms.MessageBox]::Show('Tick at least one application.', 'AI Traffic Generator'); return }
-        $prompts = @($ui.Catalog.prompts | ForEach-Object { $_.text })
-        if (-not $txtPrompt.Text.Trim() -and -not $chkRandom.Checked) { [void][System.Windows.Forms.MessageBox]::Show('Enter a prompt.', 'AI Traffic Generator'); return }
-        if ($modes -contains 'Browser' -and ($numRounds.Value -eq 0 -or $numRounds.Value * $apps.Count -gt 20)) {
+        $needsPrompt = @($modes | Where-Object { $_ -ne 'Ask' }).Count -gt 0
+        if ($needsPrompt -and -not $txtPrompt.Text.Trim() -and -not $chkRandom.Checked) { [void][System.Windows.Forms.MessageBox]::Show('Enter a prompt.', 'AI Traffic Generator'); return }
+        $opensTabs = $modes -contains 'Browser' -or ($modes -contains 'Ask' -and $chkAskBrowser.Checked)
+        if ($opensTabs -and ($numRounds.Value -eq 0 -or $numRounds.Value * $apps.Count -gt 20)) {
             $answer = [System.Windows.Forms.MessageBox]::Show("'Open in browser' will open many browser tabs. Continue?", 'AI Traffic Generator', 'YesNo', 'Warning')
             if ($answer -ne 'Yes') { return }
         }
-        $settings = @{
-            Apps = $apps; Modes = $modes; Prompts = $prompts; PromptText = $txtPrompt.Text.Trim()
+        $settings = New-Settings $ui.Catalog @{
+            Apps = $apps; Modes = $modes; PromptText = $txtPrompt.Text.Trim()
             RandomPrompt = $chkRandom.Checked; Shuffle = $chkShuffle.Checked; Rounds = [int]$numRounds.Value
             DurationMinutes = [int]$numDuration.Value; DelayMs = [int]$numDelay.Value
             Concurrency = [int]$numParallel.Value; TimeoutSec = [int]$numTimeout.Value; Proxy = $txtProxy.Text.Trim()
-            UserAgent = [string](Get-Prop $ui.Catalog 'userAgent' 'Mozilla/5.0'); Markers = @(Get-Prop $ui.Catalog 'blockMarkers' @())
+            AnswerTimeoutSec = [int]$numAnswerTimeout.Value; AskInBrowser = $chkAskBrowser.Checked
         }
         try { $ui.State = New-RunState $settings }
         catch { [void][System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'AI Traffic Generator', 'OK', 'Error'); return }
@@ -747,18 +925,85 @@ function Show-Window {
     $btnEdit.Add_Click({ Start-Process notepad.exe -ArgumentList "`"$Catalog`"" })
     $btnReload.Add_Click({ & $loadCatalog })
 
+    $getRowText = {
+        param($r)
+        $lines = @($r.PSObject.Properties | Where-Object { $_.Name -notin 'Prompt', 'Answer' } | ForEach-Object { '{0}: {1}' -f $_.Name, $_.Value })
+        if ($r.Prompt) { $lines += ''; $lines += $(if ($r.Mode -eq 'Ask') { 'Question:' } else { 'Prompt:' }); $lines += $r.Prompt }
+        if ($r.Answer) { $lines += ''; $lines += 'Answer:'; $lines += ($r.Answer -split "`r?`n") }
+        return ($lines -join "`r`n")
+    }
+    $list.Add_SelectedIndexChanged({
+        if ($list.SelectedItems.Count -eq 0) { return }
+        $details.Text = & $getRowText $list.SelectedItems[0].Tag
+    })
     $list.Add_DoubleClick({
         if ($list.SelectedItems.Count -eq 0) { return }
-        $r = $list.SelectedItems[0].Tag
-        $text = ($r.PSObject.Properties | ForEach-Object { '{0}: {1}' -f $_.Name, $_.Value }) -join "`r`n"
-        [System.Windows.Forms.Clipboard]::SetText($text)
-        [void][System.Windows.Forms.MessageBox]::Show($text + "`r`n`r`n(copied to clipboard)", 'Request details')
+        [System.Windows.Forms.Clipboard]::SetText((& $getRowText $list.SelectedItems[0].Tag))
+        $statusLabel.Text = 'Row details copied to the clipboard'
+    })
+
+    $btnKeys.Add_Click({
+        $names = @(Get-KeyNames $ui.Catalog)
+        $saved = @{}
+        try { $saved = Read-SavedKeys } catch { }
+        $dlg = New-Object System.Windows.Forms.Form
+        $dlg.Text = 'API keys'; $dlg.FormBorderStyle = 'FixedDialog'; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+        $dlg.StartPosition = 'CenterParent'; $dlg.AutoSize = $true; $dlg.AutoSizeMode = 'GrowAndShrink'; $dlg.Font = $form.Font
+        $t = New-Object System.Windows.Forms.TableLayoutPanel
+        $t.AutoSize = $true; $t.ColumnCount = 3; $t.Padding = New-Object System.Windows.Forms.Padding(10); $t.Dock = 'Fill'
+        $dlg.Controls.Add($t)
+        $intro = New-Caption ("Keys let 'Ask' get real answers from the APIs. They are saved encrypted for your Windows`r`n" +
+            "account in $KeysFile.`r`nLeave a box empty to remove that key. Variables already set in Windows are used when the box is empty.")
+        $t.Controls.Add($intro, 0, 0); $t.SetColumnSpan($intro, 3)
+        $boxes = @{}
+        $row = 1
+        foreach ($name in $names) {
+            $box = New-Object System.Windows.Forms.TextBox
+            $box.Width = 420; $box.UseSystemPasswordChar = $true
+            if ($saved.ContainsKey($name)) { $box.Text = $saved[$name] }
+            $keyState = if ($saved.ContainsKey($name)) { 'saved' }
+                        elseif ([Environment]::GetEnvironmentVariable($name)) { 'set in Windows' } else { '' }
+            $t.Controls.Add((New-Caption $name), 0, $row)
+            $t.Controls.Add($box, 1, $row)
+            $t.Controls.Add((New-Caption $keyState), 2, $row)
+            $boxes[$name] = $box
+            $row++
+        }
+        $show = New-Check 'Show keys' $false
+        $show.Add_CheckedChanged({ foreach ($b in $boxes.Values) { $b.UseSystemPasswordChar = -not $show.Checked } })
+        $t.Controls.Add($show, 1, $row); $row++
+        $okFlow = New-Flow
+        $ok = New-Object System.Windows.Forms.Button; $ok.Text = 'Save'; $ok.DialogResult = 'OK'
+        $cancel = New-Object System.Windows.Forms.Button; $cancel.Text = 'Cancel'; $cancel.DialogResult = 'Cancel'
+        $okFlow.Controls.AddRange(@($ok, $cancel))
+        $t.Controls.Add($okFlow, 1, $row)
+        $dlg.AcceptButton = $ok; $dlg.CancelButton = $cancel
+        if ($dlg.ShowDialog($form) -eq 'OK') {
+            $keys = @{}
+            foreach ($name in $names) {
+                $value = $boxes[$name].Text.Trim()
+                if ($value) {
+                    $keys[$name] = $value
+                    [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+                } elseif ($saved.ContainsKey($name) -and [Environment]::GetEnvironmentVariable($name) -eq $saved[$name]) {
+                    [Environment]::SetEnvironmentVariable($name, $null, 'Process')
+                }
+            }
+            try {
+                Save-Keys $keys
+                $statusLabel.Text = "API keys saved: $($keys.Count)"
+            } catch {
+                [void][System.Windows.Forms.MessageBox]::Show("The keys are used now but could not be saved: $($_.Exception.Message)", 'API keys', 'OK', 'Warning')
+            }
+        }
+        $dlg.Dispose()
     })
 
     # Splitter positions can only be set once the form has its size.
     $form.Add_Shown({
-        $split.SplitterDistance = [Math]::Min(380, $split.Height - 150)
+        $split.SplitterDistance = [Math]::Min(420, $split.Height - 200)
         $top.SplitterDistance = [Math]::Min(430, $top.Width - 400)
+        $resultSplit.SplitterDistance = [Math]::Max(80, $resultSplit.Height - 140)
     })
 
     $form.Add_FormClosing({
@@ -783,6 +1028,8 @@ if ($List) {
     } | Format-Table -AutoSize | Out-String -Width 200
     return
 }
+
+Import-SavedKeys
 
 if ($NoGui) {
     Invoke-Console (Read-Catalog $Catalog)
